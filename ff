@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly FF_VERSION="0.1.0"
+readonly SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
+readonly WORKER="$SCRIPT_DIR/libexec/ff-worker"
+readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ff"
+readonly LAST_JOB_FILE="$STATE_DIR/last-job"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ff [OPTIONS] [--] COMMAND [ARG...]
+  ff --shell COMMAND
+
+Run a command as a detached systemd user service and notify when it finishes.
+
+Launch options:
+  -n, --name NAME       Give the job a readable name
+  -E, --env NAME[=VAL]  Copy or set an environment variable (repeatable)
+  -s, --shell COMMAND   Run shell syntax through $SHELL -lc
+  --                    End ff options
+
+Job commands:
+  -l, --list            List running and failed ff jobs
+  --last                Print the most recently launched job ID
+  --status [JOB]        Show job status (defaults to the last job)
+  --logs [JOB] [-f]     Show job logs (defaults to the last job)
+  --cancel [JOB]        Stop a job (defaults to the last job)
+  --clean               Forget completed failed ff units; logs remain
+  -h, --help            Show this help
+  --version             Show the version
+
+Examples:
+  ff sleep 30
+  ff --name tests dotnet test
+  ff --env AWS_PROFILE -- terraform apply -auto-approve
+  ff --shell 'dotnet test && dotnet publish'
+  ff --logs
+EOF
+}
+
+die() {
+  printf 'ff: %s\n' "$*" >&2
+  exit 2
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+read_last_job() {
+  [[ -s "$LAST_JOB_FILE" ]] || die "no previous job is recorded"
+  local job
+  IFS= read -r job <"$LAST_JOB_FILE"
+  [[ -n "$job" ]] || die "the last-job record is empty"
+  printf '%s\n' "$job"
+}
+
+normalize_job() {
+  local job=${1%.service}
+  [[ $job =~ ^ff-[a-zA-Z0-9_.@:-]+$ ]] || die "invalid ff job ID: $1"
+  printf '%s.service\n' "$job"
+}
+
+record_last_job() {
+  local job=$1 temp
+  umask 077
+  mkdir -p -- "$STATE_DIR"
+  temp=$(mktemp --tmpdir="$STATE_DIR" .last-job.XXXXXX)
+  printf '%s\n' "$job" >"$temp"
+  mv -f -- "$temp" "$LAST_JOB_FILE"
+}
+
+job_or_last() {
+  if [[ -n ${1:-} ]]; then
+    printf '%s\n' "$1"
+  else
+    read_last_job
+  fi
+}
+
+case ${1:-} in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  --version)
+    printf 'ff %s\n' "$FF_VERSION"
+    exit 0
+    ;;
+  -l | --list)
+    require_command systemctl
+    systemctl --user list-units --all --type=service 'ff-*.service'
+    exit 0
+    ;;
+  --last)
+    read_last_job
+    exit 0
+    ;;
+  --status)
+    require_command systemctl
+    job=$(job_or_last "${2:-}")
+    unit=$(normalize_job "$job")
+    systemctl --user status --no-pager "$unit"
+    exit $?
+    ;;
+  --logs)
+    require_command journalctl
+    shift
+    job=""
+    follow=0
+    while (($# > 0)); do
+      case $1 in
+        -f | --follow) follow=1 ;;
+        -*) die "unknown logs option: $1" ;;
+        *)
+          [[ -z $job ]] || die "only one job ID may be supplied to --logs"
+          job=$1
+          ;;
+      esac
+      shift
+    done
+    job=$(job_or_last "$job")
+    unit=$(normalize_job "$job")
+    journal_args=(--user --unit "$unit" --no-pager)
+    ((follow == 1)) && journal_args+=(--follow)
+    journalctl "${journal_args[@]}"
+    exit $?
+    ;;
+  --cancel)
+    require_command systemctl
+    job=$(job_or_last "${2:-}")
+    unit=$(normalize_job "$job")
+    systemctl --user stop "$unit"
+    printf 'Stopped %s\n' "${unit%.service}"
+    exit 0
+    ;;
+  --clean)
+    require_command systemctl
+    systemctl --user reset-failed 'ff-*.service'
+    printf 'Cleared failed ff unit state. Journal logs were retained.\n'
+    exit 0
+    ;;
+esac
+
+[[ -x $WORKER ]] || die "worker is missing or not executable: $WORKER"
+require_command systemd-run
+
+name=""
+shell_command=""
+declare -a requested_env=()
+
+while (($# > 0)); do
+  case $1 in
+    -n | --name)
+      (($# >= 2)) || die "$1 requires a value"
+      name=$2
+      shift 2
+      ;;
+    -E | --env)
+      (($# >= 2)) || die "$1 requires NAME or NAME=VALUE"
+      requested_env+=("$2")
+      shift 2
+      ;;
+    -s | --shell)
+      (($# >= 2)) || die "$1 requires a command string"
+      shell_command=$2
+      shift 2
+      (($# == 0)) || die "--shell must be the final ff option"
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*) die "unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+
+declare -a command_args=()
+if [[ -n $shell_command ]]; then
+  shell_path=${SHELL:-/bin/sh}
+  [[ -x $shell_path ]] || die "shell is not executable: $shell_path"
+  command_args=("$shell_path" -lc "$shell_command")
+  display=$shell_command
+  [[ -n $name ]] || name="shell"
+else
+  (($# > 0)) || {
+    usage >&2
+    die "a command is required"
+  }
+  command_args=("$@")
+  printf -v display '%q ' "${command_args[@]}"
+  display=${display% }
+  [[ -n $name ]] || name=$(basename -- "${command_args[0]}")
+fi
+
+[[ $name != *$'\n'* ]] || die "job names cannot contain newlines"
+slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//; s/-$//' | cut -c1-24)
+[[ -n $slug ]] || slug="job"
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+job_id="ff-${slug}-${timestamp}-${BASHPID}-${RANDOM}"
+
+declare -a run_args=(
+  --user
+  --unit "$job_id"
+  --description "ff: $name"
+  --service-type exec
+  --same-dir
+  --expand-environment=no
+)
+
+# Preserve the command lookup and the most common developer-session sockets.
+for variable in PATH SSH_AUTH_SOCK DOTNET_ROOT; do
+  if [[ -v $variable ]]; then
+    run_args+=(--setenv "$variable")
+  fi
+done
+
+# Internal test/debug switch. It is intentionally opt-in.
+if [[ ${FF_NO_NOTIFY:-0} == 1 ]]; then
+  run_args+=(--setenv FF_NO_NOTIFY=1)
+fi
+
+for environment in "${requested_env[@]}"; do
+  if [[ $environment == *=* ]]; then
+    variable=${environment%%=*}
+  else
+    variable=$environment
+    [[ -v $variable ]] || die "environment variable is not set: $variable"
+  fi
+  [[ $variable =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || die "invalid environment variable name: $variable"
+  run_args+=(--setenv "$environment")
+done
+
+systemd_output=$(systemd-run "${run_args[@]}" "$WORKER" "$job_id" "$display" -- "${command_args[@]}")
+record_last_job "$job_id"
+
+printf 'Started %s: %s\n' "$job_id" "$display"
+printf 'Logs: ff --logs %s\n' "$job_id"
+[[ -z $systemd_output ]] || printf '%s\n' "$systemd_output"
+
