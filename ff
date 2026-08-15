@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly FF_VERSION="0.1.0"
+readonly FF_VERSION="0.2.0"
 readonly SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
 readonly WORKER="$SCRIPT_DIR/libexec/ff-worker"
@@ -242,4 +242,3 @@ record_last_job "$job_id"
 printf 'Started %s: %s\n' "$job_id" "$display"
 printf 'Logs: ff --logs %s\n' "$job_id"
 [[ -z $systemd_output ]] || printf '%s\n' "$systemd_output"
-

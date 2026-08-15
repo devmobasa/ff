@@ -4,19 +4,20 @@ set -euo pipefail
 
 readonly REPO_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)"
 readonly BIN_DIR="${HOME}/.local/bin"
-readonly LINK_PATH="$BIN_DIR/ff"
-readonly TARGET="$REPO_DIR/ff"
-
 mkdir -p -- "$BIN_DIR"
 
-if [[ -e $LINK_PATH || -L $LINK_PATH ]]; then
-  existing=$(readlink -f -- "$LINK_PATH" 2>/dev/null || true)
-  if [[ $existing != "$TARGET" ]]; then
-    printf 'install: refusing to replace existing %s\n' "$LINK_PATH" >&2
-    exit 1
+for command_name in ff fft; do
+  link_path="$BIN_DIR/$command_name"
+  target="$REPO_DIR/$command_name"
+
+  if [[ -e $link_path || -L $link_path ]]; then
+    existing=$(readlink -f -- "$link_path" 2>/dev/null || true)
+    if [[ $existing != "$target" ]]; then
+      printf 'install: refusing to replace existing %s\n' "$link_path" >&2
+      exit 1
+    fi
   fi
-fi
 
-ln -sfn -- "$TARGET" "$LINK_PATH"
-printf 'Installed ff -> %s\n' "$TARGET"
-
+  ln -sfn -- "$target" "$link_path"
+  printf 'Installed %s -> %s\n' "$command_name" "$target"
+done

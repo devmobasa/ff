@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly FFT_VERSION="0.2.0"
+readonly SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
+readonly WORKER="$SCRIPT_DIR/libexec/ff-worker"
+readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ff"
+readonly LOG_DIR="$STATE_DIR/terminal"
+readonly LAST_JOB_FILE="$STATE_DIR/last-terminal-job"
+readonly WINDOW_CLASS_PREFIX="org.omarchy.fft"
+readonly SPECIAL_WORKSPACE="ff"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  fft [OPTIONS] [--] COMMAND [ARG...]
+  fft --shell COMMAND
+
+Run a command in a dedicated Ghostty window on a hidden special workspace.
+The window closes automatically when the command finishes.
+
+Launch options:
+  -n, --name NAME       Give the job a readable name
+  -s, --shell COMMAND   Run shell syntax through $SHELL -lc
+  --                    End fft options
+
+Window and job commands:
+  --show                Reveal the fft special workspace
+  --hide                Hide the fft special workspace
+  --toggle              Toggle the fft special workspace
+  -l, --list            List open fft terminal windows
+  --last                Print the most recently launched fft job ID
+  --logs [JOB] [-f]     Show a job log (defaults to the last job)
+  --diagnostics [JOB]   Show Ghostty startup diagnostics
+  --cancel [JOB]        Gracefully close a job window
+  -h, --help            Show this help
+  --version             Show the version
+
+Examples:
+  fft ./install.sh
+  fft --name update paru -Syu
+  fft --shell 'make clean && make -j8'
+  fft --show
+  fft --logs --follow
+EOF
+}
+
+die() {
+  printf 'fft: %s\n' "$*" >&2
+  exit 2
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+read_last_job() {
+  [[ -s $LAST_JOB_FILE ]] || die "no previous terminal job is recorded"
+  local job
+  IFS= read -r job <"$LAST_JOB_FILE"
+  [[ -n $job ]] || die "the last-terminal-job record is empty"
+  printf '%s\n' "$job"
+}
+
+job_or_last() {
+  if [[ -n ${1:-} ]]; then
+    printf '%s\n' "$1"
+  else
+    read_last_job
+  fi
+}
+
+normalize_job() {
+  local job=$1
+  [[ $job =~ ^fft-[a-zA-Z0-9_.@:-]+$ ]] || die "invalid fft job ID: $job"
+  printf '%s\n' "$job"
+}
+
+record_last_job() {
+  local job=$1 temp
+  umask 077
+  mkdir -p -- "$STATE_DIR"
+  temp=$(mktemp --tmpdir="$STATE_DIR" .last-terminal-job.XXXXXX)
+  printf '%s\n' "$job" >"$temp"
+  mv -f -- "$temp" "$LAST_JOB_FILE"
+}
+
+workspace_is_visible() {
+  hyprctl monitors -j | jq -e --arg workspace "special:$SPECIAL_WORKSPACE" \
+    'any(.[]; .specialWorkspace.name == $workspace)' >/dev/null
+}
+
+toggle_workspace() {
+  hyprctl eval "hl.dispatch(hl.dsp.workspace.toggle_special(\"$SPECIAL_WORKSPACE\"))" >/dev/null
+}
+
+case ${1:-} in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  --version)
+    printf 'fft %s\n' "$FFT_VERSION"
+    exit 0
+    ;;
+  --show)
+    require_command hyprctl
+    require_command jq
+    workspace_is_visible || toggle_workspace
+    exit 0
+    ;;
+  --hide)
+    require_command hyprctl
+    require_command jq
+    workspace_is_visible && toggle_workspace
+    exit 0
+    ;;
+  --toggle)
+    require_command hyprctl
+    toggle_workspace
+    exit 0
+    ;;
+  -l | --list)
+    require_command hyprctl
+    require_command jq
+    hyprctl clients -j | jq -r --arg prefix "$WINDOW_CLASS_PREFIX." '
+      ["JOB", "WORKSPACE", "PID", "ADDRESS"],
+      (.[] | select(.class | startswith($prefix)) |
+        [(.title | sub("^fft:"; "")), .workspace.name, (.pid | tostring), .address]) |
+      @tsv
+    ' | column -t -s $'\t'
+    exit 0
+    ;;
+  --last)
+    read_last_job
+    exit 0
+    ;;
+  --logs)
+    shift
+    job=""
+    follow=0
+    while (($# > 0)); do
+      case $1 in
+        -f | --follow) follow=1 ;;
+        -*) die "unknown logs option: $1" ;;
+        *)
+          [[ -z $job ]] || die "only one job ID may be supplied to --logs"
+          job=$1
+          ;;
+      esac
+      shift
+    done
+    job=$(normalize_job "$(job_or_last "$job")")
+    log_file="$LOG_DIR/$job.log"
+    [[ -f $log_file ]] || die "log not found: $log_file"
+    if ((follow == 1)); then
+      exec tail -n 100 --follow=name --retry -- "$log_file"
+    else
+      exec cat -- "$log_file"
+    fi
+    ;;
+  --diagnostics)
+    job=$(normalize_job "$(job_or_last "${2:-}")")
+    diagnostics_file="$LOG_DIR/$job.ghostty.log"
+    [[ -f $diagnostics_file ]] || die "diagnostics not found: $diagnostics_file"
+    exec cat -- "$diagnostics_file"
+    ;;
+  --cancel)
+    require_command hyprctl
+    require_command jq
+    job=$(normalize_job "$(job_or_last "${2:-}")")
+    address=$(hyprctl clients -j | jq -r --arg prefix "$WINDOW_CLASS_PREFIX." --arg title "fft:$job" '
+      .[] | select((.class | startswith($prefix)) and .title == $title) | .address
+    ' | head -n 1)
+    [[ -n $address ]] || die "no open window found for $job"
+    hyprctl eval "hl.dispatch(hl.dsp.window.close({ window = \"address:$address\" }))" >/dev/null
+    printf 'Closed %s\n' "$job"
+    exit 0
+    ;;
+esac
+
+[[ -x $WORKER ]] || die "worker is missing or not executable: $WORKER"
+for required in ghostty hyprctl jq setsid; do
+  require_command "$required"
+done
+
+name=""
+shell_command=""
+while (($# > 0)); do
+  case $1 in
+    -n | --name)
+      (($# >= 2)) || die "$1 requires a value"
+      name=$2
+      shift 2
+      ;;
+    -s | --shell)
+      (($# >= 2)) || die "$1 requires a command string"
+      shell_command=$2
+      shift 2
+      (($# == 0)) || die "--shell must be the final fft option"
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*) die "unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+
+declare -a command_args=()
+if [[ -n $shell_command ]]; then
+  shell_path=${SHELL:-/bin/sh}
+  [[ -x $shell_path ]] || die "shell is not executable: $shell_path"
+  command_args=("$shell_path" -lc "$shell_command")
+  display=$shell_command
+  [[ -n $name ]] || name="shell"
+else
+  (($# > 0)) || {
+    usage >&2
+    die "a command is required"
+  }
+  command_args=("$@")
+  printf -v display '%q ' "${command_args[@]}"
+  display=${display% }
+  [[ -n $name ]] || name=$(basename -- "${command_args[0]}")
+fi
+
+[[ $name != *$'\n'* ]] || die "job names cannot contain newlines"
+slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//; s/-$//' | cut -c1-24)
+[[ -n $slug ]] || slug="job"
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+job_id="fft-${slug}-${timestamp}-${BASHPID}-${RANDOM}"
+log_file="$LOG_DIR/$job_id.log"
+diagnostics_file="$LOG_DIR/$job_id.ghostty.log"
+window_class="$WINDOW_CLASS_PREFIX.j${BASHPID}${RANDOM}"
+
+umask 077
+mkdir -p -- "$LOG_DIR"
+: >"$log_file"
+record_last_job "$job_id"
+
+declare -a worker_env=(env FF_LOG_FILE="$log_file" FF_NOTIFY_APP=fft)
+if [[ ${FF_NO_NOTIFY:-0} == 1 ]]; then
+  worker_env+=(FF_NO_NOTIFY=1)
+fi
+
+setsid -f ghostty \
+  --class="$window_class" \
+  --title="fft:$job_id" \
+  --working-directory="$PWD" \
+  -e "${worker_env[@]}" \
+  "$WORKER" "$job_id" "$display" -- "${command_args[@]}" \
+  >>"$diagnostics_file" 2>&1
+
+# Ghostty starts its PTY after the first rendered frame. A window created on a
+# never-shown special workspace may not receive that frame, so let it map
+# unfocused first and move it only after the worker confirms startup.
+moved=0
+for _ in {1..100}; do
+  address=$(hyprctl clients -j | jq -r --arg title "fft:$job_id" '
+    .[] | select(.title == $title) | .address
+  ' | head -n 1)
+
+  if [[ -n $address ]] && grep -qF '[ff] started:' "$log_file"; then
+    hyprctl eval "hl.dispatch(hl.dsp.window.move({ workspace = \"special:$SPECIAL_WORKSPACE\", window = \"address:$address\", follow = false }))" >/dev/null
+    moved=1
+    break
+  fi
+
+  # A very short command can finish and close before it needs moving.
+  if [[ -s $log_file ]] && [[ -z $address ]]; then
+    break
+  fi
+
+  sleep 0.05
+done
+
+printf 'Started %s: %s\n' "$job_id" "$display"
+if ((moved == 0)) && [[ -n ${address:-} ]]; then
+  printf 'Warning: the terminal started but could not be moved to special:%s.\n' "$SPECIAL_WORKSPACE" >&2
+fi
+printf 'Show: fft --show\n'
+printf 'Logs: fft --logs %s\n' "$job_id"
